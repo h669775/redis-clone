@@ -1,4 +1,5 @@
 import java.io.BufferedReader;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.PrintWriter;
@@ -15,22 +16,28 @@ public class Server {
 
         Store store = new Store();
 
+        
         while (true) { //creates a loop so that different clients can connect after eachother without the server stopping. It blocks until a client connects.
+
         Socket client = socket.accept(); //accept pauses the program until a client connects. When one does it return a socket object representing that one secific connection, stored in client
         
-        InputStream rawInput = client.getInputStream(); //Gets the raw inputstream from that client. Reads byte from the client
+        new Thread(() -> {
+            try { //Try catch to catch IOexception
+            InputStream rawInput = client.getInputStream(); //Gets the raw inputstream from that client. Reads byte from the client
         InputStreamReader textInput = new InputStreamReader(rawInput); //Wraps that raw byte stream, which converts bytes into characters (text encoding)
         BufferedReader reader = new BufferedReader(textInput); //Wraps that in a bufferedReader where the .readLine() method reads a full line of text at a time instead of one character at a time
        
         String text; //Holds whatever line gets read later.
         PrintWriter pw = new PrintWriter(client.getOutputStream(), true); //Is what the client sees as output from the serer (they will see OK!) AKA the response the client receives.
 
+
+
+        //Loop for å håndtere en eller fleire requests fra klienten
         while((text = reader.readLine()) != null) {
         System.out.println(text);
 
         //Extract the count from the REDIS formatted input from the client
         int count = Integer.parseInt(text.substring(1)); //count is the number of elements in the command so the loop knows how many times to iterate
-        System.out.println("Count: " + count);
         
         //Splits into array just like .split(text) did but now it accepts redis syntax
         String[] parts = new String[count];
@@ -80,7 +87,19 @@ public class Server {
             pw.flush();
         }
         }
-        client.close();
+        } 
+        catch (Exception e) {
+            System.out.println("Thread threw an exception!");
+        } 
+        finally {
+            try {
+                client.close();
+            } catch (Exception e) {
+            System.out.println("client.close threw an exception");
+            }
+        }
+
+        }).start();
     }
     }
 }

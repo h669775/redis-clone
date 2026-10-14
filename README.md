@@ -184,8 +184,66 @@ adding a final `else` branch that replies `-ERROR: Unknown command\r\n` for
 any unrecognized command — a response (even an error) is enough to unblock
 `redis-cli` and let it proceed to accept real typed commands.
 
+### Step 4 — Concurrency (`src/Server.java`) — done (each client on its own thread)
+Previously, `.accept()` was only called again *after* the current client's
+entire read/respond loop had finished — meaning a second client couldn't
+connect at all while the first was still active, no matter how slow or idle
+it was.
+
+What changed:
+- The per-client logic (everything from `getInputStream()` down through
+  `client.close()`) is now wrapped in `new Thread(() -> { ... }).start();`,
+  handed off immediately after `.accept()` returns. The main loop's only job
+  per iteration is now: accept a connection, launch a thread for it, go
+  straight back to `.accept()` for the next one — never blocked by any one
+  client.
+- The thread body is wrapped in `try { ... } catch (Exception e) { ... }
+  finally { client.close(); }` — a single broad `catch (Exception e)`,
+  deliberately, since this is a failure-isolation boundary: *any* unexpected
+  problem from one client (malformed input, a bug, anything) should be
+  contained to that one thread, never crash the server or other clients.
+  The `finally` guarantees `client.close()` always runs — even if something
+  above it threw — releasing the socket (and its OS-level file descriptor)
+  so the server doesn't leak resources over time as clients come and go.
+- Verified concurrency genuinely works: connected a deliberately
+  "slow"/open client first, then a second client while the first was still
+  connected — the second client got its response immediately, proving it
+  wasn't stuck waiting behind the first.
+
+**Bug found and fixed along the way — uncaught exception leaking a
+socket:** while testing, a malformed client command crashed its thread with
+an uncaught `NumberFormatException` (only `IOException` was caught at the
+time) — the thread died silently, but `client.close()` never ran, since it
+sat after the exception point with no `finally`. The symptom: the crashed
+client's `nc` process just hung forever, since the server never told its
+OS to tear down that TCP connection. This is exactly why the `finally`
+block exists now, and why `catch (Exception e)` (broad, but intentional at
+this specific boundary) replaced separate `catch (IOException)` /
+`catch (NumberFormatException)` blocks — any future exception type is
+covered the same way, without needing to anticipate and add a new `catch`
+for each one.
+
+**What `client.close()` actually does**, worth remembering: it tells the OS
+to close the underlying TCP connection and release the file descriptor tied
+to that socket. Every open socket holds onto a limited OS resource; skipping
+`close()` means that resource stays reserved forever even after the
+client's work is done — eventually exhausting the limit and causing new
+connections to start failing. (Analogy: `accept()` picks up a phone line for
+one call; `close()` actually hangs it up, freeing that line for the next
+caller. Skipping it leaves the line permanently tied up.)
+
+**Known limitation (not yet addressed):** `Store`'s `HashMap` is now shared
+across multiple threads calling `setValue`/`getValue`/`deleteValue`
+concurrently, with no synchronization at all. `HashMap` is **not**
+thread-safe — concurrent writes from different threads can corrupt its
+internal structure or produce inconsistent reads. This hasn't caused a
+visible problem yet (simple test connections, low real concurrency), but is
+a real, latent bug. Next thing to address before trusting this under real
+concurrent load.
+
 ### Next up
-- Handle multiple clients concurrently (step 4), using threads.
+- Make `Store` thread-safe (e.g. `synchronized` methods, or a concurrent map
+  like `ConcurrentHashMap`) — currently unsafe under real concurrent access.
 - Maybe: fix content-line reading to respect `$<length>` exactly, instead of
   relying on `readLine()`.
 
