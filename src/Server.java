@@ -1,5 +1,4 @@
 import java.io.BufferedReader;
-import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.PrintWriter;
@@ -14,7 +13,7 @@ public class Server {
             System.out.println("Server listening on port 6379!");
         }
 
-        Store store = new Store();
+        Store store = new Store(); //Will store data in memory
 
         
         while (true) { //creates a loop so that different clients can connect after eachother without the server stopping. It blocks until a client connects.
@@ -93,8 +92,10 @@ public class Server {
         } 
         finally {
             try {
-                client.close();
-            } catch (Exception e) {
+                //.close ends the connection with the client so realeses everything tied to it.
+                client.close(); 
+            } 
+            catch (Exception e) {
             System.out.println("client.close threw an exception");
             }
         }

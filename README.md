@@ -232,20 +232,84 @@ connections to start failing. (Analogy: `accept()` picks up a phone line for
 one call; `close()` actually hangs it up, freeing that line for the next
 caller. Skipping it leaves the line permanently tied up.)
 
-**Known limitation (not yet addressed):** `Store`'s `HashMap` is now shared
-across multiple threads calling `setValue`/`getValue`/`deleteValue`
-concurrently, with no synchronization at all. `HashMap` is **not**
-thread-safe — concurrent writes from different threads can corrupt its
-internal structure or produce inconsistent reads. This hasn't caused a
-visible problem yet (simple test connections, low real concurrency), but is
-a real, latent bug. Next thing to address before trusting this under real
-concurrent load.
+**Thread-safety fix — `HashMap` → `ConcurrentHashMap`:** `Store`'s map was
+shared across multiple client threads with zero synchronization — `HashMap`
+is **not** thread-safe; concurrent writes from different threads can corrupt
+its internal structure (a well-documented real bug class: concurrent
+`HashMap` resizing has caused infinite loops pinning a CPU core at 100% in
+older Java versions) or silently lose updates. Fixed by swapping to
+`java.util.concurrent.ConcurrentHashMap` in `Store.java` — a drop-in
+replacement here, since it implements the same `Map` interface (`get`/`put`/
+`remove` unchanged) but is built to be safely used by multiple threads at
+once, including real internal parallelism rather than locking the whole map
+per operation. Verified with `redis-cli` afterward — identical external
+behavior (`SET`/`GET`/`DEL` all still correct), confirming the swap changed
+only the thread-safety guarantee, not any observable behavior.
+
+(Noted but not chosen: the alternative fix would have been marking
+`Store`'s methods `synchronized`, forcing one-at-a-time access manually —
+simpler to reason about, but serializes all data access, losing the
+parallelism threading was meant to add. `ConcurrentHashMap` gets
+thread-safety without that cost.)
+
+### Step 5 — Persistence (`src/Store.java`) — done (append-only log)
+Goal: make data survive a server restart. Previously, `Store`'s map lived
+only in memory — stopping and restarting the server lost everything.
+
+Design decisions made before writing code:
+- **Log format**: plain, human-readable text, reusing the original
+  space-separated style (`SET key value` / `DEL key`), one command per line
+  — not RESP, which real Redis uses for its AOF, but a deliberate
+  simplification here.
+- **Where the logic lives**: inside `Store` itself (not `Server`), since
+  `Store` is what actually knows when a real mutation happens. This keeps
+  persistence a property of the data store, independent of how commands
+  arrive.
+
+What changed:
+- `setValue`/`deleteValue` each append one line to `log.txt` (via
+  `FileWriter(..., true)` — the `true` means *append*, not overwrite) right
+  after mutating the in-memory map. Both use try-with-resources
+  (`try (FileWriter fw = ...) { ... }`) so the writer is guaranteed to close
+  (and actually flush to disk) even if something throws.
+- `Store` got a constructor: on startup, if `log.txt` exists, it reads the
+  file line by line and replays each command — but by calling
+  `hashmap.put(...)`/`hashmap.remove(...)` **directly**, not
+  `setValue`/`deleteValue`. Calling the real methods during replay would
+  re-trigger logging, doubling (and on the next restart, quadrupling, etc.)
+  the log file.
+- Verified end-to-end: `SET name ola` → restart the server (new process,
+  fresh `Store`) → `GET name` without ever re-sending `SET` → correctly
+  returned `ola`, proving the constructor replayed the log and rebuilt state
+  before accepting any connections.
+
+**Bug found and fixed — multi-word values corrupted by replay:** a value
+containing a space (`SET age "22 ar"`) worked correctly *before* a restart
+(live command handling already reads exact RESP content lines, unaffected),
+but came back as just `"22"` — silently truncated — *after* a restart.
+Cause: the log line `SET age 22 ar` split on plain `" "` produces 4 elements
+(`["SET", "age", "22", "ar"]`), and the replay code only read `parts[2]`
+(`"22"`), with no idea `parts[3]` was part of the same value — the same
+fundamental "delimiter can't distinguish a real separator from a value that
+happens to contain one" problem RESP's length-prefixing exists to solve,
+resurfacing in the simpler log format. Fixed with `line.split(" ", 3)` — the
+`limit` argument caps the split at 3 pieces, so everything after the second
+space-cut gets kept together as one final piece
+(`["SET", "age", "22 ar"]`). Works uniformly for `DEL` lines too, which
+naturally only produce 2 pieces regardless of the limit.
+
+Known limitations:
+- The log only ever grows — it's never compacted/rewritten (real Redis
+  periodically rewrites its AOF to drop dead history, e.g. a key that was
+  `SET` then later `DEL`eted doesn't need either line kept forever). Not
+  addressed yet.
+- No handling yet for a log line that's corrupted/incomplete (e.g. the
+  process crashes mid-write) — replay would likely throw on such a line.
 
 ### Next up
-- Make `Store` thread-safe (e.g. `synchronized` methods, or a concurrent map
-  like `ConcurrentHashMap`) — currently unsafe under real concurrent access.
-- Maybe: fix content-line reading to respect `$<length>` exactly, instead of
-  relying on `readLine()`.
+- Key expiration (TTL), then replication to a second server (steps 6+).
+- Maybe: fix content-line reading in `Server.java`'s RESP parsing to respect
+  `$<length>` exactly, instead of relying on `readLine()`.
 
 ## Running it manually
 
