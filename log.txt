@@ -1,1 +1,12 @@
-SET age 22 ar
+SET name ola
+SET temp hello
+SET temp hello
+DEL temp
+SET temp hello
+SET temp hello
+DEL temp
+SET temp hello
+SET temp hello
+DEL temp
+SET temp hello
+DEL temp
