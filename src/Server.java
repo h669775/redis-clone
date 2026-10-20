@@ -82,6 +82,15 @@ public class Server {
                 pw.print("+OK\r\n");
                 pw.flush();
             }
+        } else if (parts[0].equals("EXPIRE")) {
+            if (parts.length < 3) {
+                pw.print("-ERROR: EXPIRE requires a key and a expiry number\r\n");
+                pw.flush();
+            } else {
+                store.setExpiry(parts[1], Integer.parseInt(parts[2]));
+                pw.print("+OK\r\n");
+                pw.flush();
+            }
         } else {
             pw.print("-ERROR: Unknown command\r\n");
             pw.flush();

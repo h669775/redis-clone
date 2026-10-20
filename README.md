@@ -1,8 +1,9 @@
 # Redis Clone (Java, no frameworks)
 
 A Redis clone built from scratch in plain Java, to understand what's actually
-happening underneath tools like Redis and frameworks like Spring — networking,
-protocols, concurrency, persistence — instead of treating them as magic.
+happening underneath tools like Redis and frameworks like Spring —
+networking, protocols, concurrency, persistence — instead of treating them
+as magic.
 
 ## Plan
 
@@ -16,300 +17,142 @@ protocols, concurrency, persistence — instead of treating them as magic.
 ## Progress
 
 ### Step 1 — In-memory store (`src/Store.java`) — done
-- Wraps a `HashMap<String, String>`.
-- `setValue(key, value)` / `getValue(key)` / `deleteValue(key)`.
-- `getValue` on a missing key returns `null` (default `HashMap` behavior) —
-  revisit this when implementing RESP in step 3, since real Redis returns a
-  "nil" response over the wire, not a null/exception.
-- Verified by running `main` directly: set two keys, read them back, delete
-  one, confirm it reads back as `null` afterward.
+`HashMap<String, String>` wrapped by `setValue`/`getValue`/`deleteValue`.
+Missing key → `null`. Verified via `main`.
 
-### Step 2 — TCP server (`src/Server.java`) — connected to Store, done (single client at a time)
-
-(Note: response formatting here has since been replaced by RESP — see Step 3
-below. Kept for history; `"OK"`/`"ERROR: ..."`/`"null"` in this section
-describe the pre-RESP behavior.)
-- `ServerSocket` bound to port 6379 (Redis's default port).
-- Outer `while (true)` loop around `.accept()` — after one client
-  disconnects, the server goes back to waiting for the next one instead of
-  exiting.
-- `.accept()` blocks until a client connects, returns a `Socket` for that one
-  connection.
-- Reads lines of text from the client via
-  `Socket.getInputStream()` → `InputStreamReader` → `BufferedReader.readLine()`.
-- Sends a response back via
-  `Socket.getOutputStream()` → `PrintWriter` (autoFlush `true`).
-- Inner loop per client: `while ((text = reader.readLine()) != null)` — keeps
-  reading/responding to lines from the same client until it disconnects
-  (`readLine()` returns `null` when the connection closes).
-- `client.close()` called right after the inner loop ends, releasing that
-  connection before looping back to `.accept()` for the next client.
-- `Store` is instantiated **once**, outside the `while(true)` loop, so data
-  persists across different client connections (not a fresh `HashMap` per
-  client).
-- Each line read is parsed with `text.split(" ")` into a `String[]`, e.g.
-  `"SET name ola"` → `["SET", "name", "ola"]`. `parts[0]` is matched against
-  `"SET"` / `"GET"` / `"DEL"` (using `.equals()`, not `==`) and routed to the
-  matching `Store` method:
-  - `SET key value` → `store.setValue(key, value)`, replies `"OK"`.
-  - `GET key` → replies with `store.getValue(key)` directly (so the value
-    itself is sent back, not just `"OK"`).
-  - `DEL key` → `store.deleteValue(key)`, replies `"OK"`.
-- Validates `parts.length` before indexing into it, per command (`SET` needs
-  ≥3, `GET`/`DEL` need ≥2) — replies an `"ERROR: ..."` message instead of
-  proceeding when too few arguments are given.
-- Verified manually end-to-end: `SET name ola` → `OK`, `GET name` → `ola`,
-  `DEL name` → `OK`, `GET name` again → `null` (correctly gone). Also
-  verified malformed input no longer crashes the server: sending bare `GET`
-  or `SET onlykey` returns an error message and the server stays alive and
-  keeps handling subsequent valid commands in the same connection.
-
-Known limitations (expected at this stage, not bugs):
-- Only handles one client **at a time** — `.accept()` is only called again
-  after the previous client's loop has fully ended, so a second client can't
-  connect while the first is still active. Fixing this (true concurrency,
-  many clients at once) is step 4.
-- `GET` on a missing key replies the literal text `"null"` — fine for a raw
-  `nc` test, but not real Redis wire format. Revisit once RESP (step 3) is
-  implemented.
-- Any exception *not* already guarded against (only the "too few arguments"
-  case is handled) would still crash the whole server, since there's no
-  threading/isolation yet and no outer `try/catch` safety net.
+### Step 2 — TCP server (`src/Server.java`) — done (single client at a time)
+`ServerSocket` on port 6379, `while(true)` around `.accept()`, one client
+handled per connection via `BufferedReader`/`PrintWriter` over the socket
+streams. Commands parsed with `text.split(" ")`, routed to `Store`. Replies
+were plain text at this stage (`"OK"`/`"ERROR: ..."`/`"null"`) — superseded
+by RESP in step 3. Known limitation at the time: only one client at a time,
+and any unhandled exception would crash the whole server (no threading yet).
 
 ### Step 3 — RESP protocol (`src/Server.java`) — done, verified against real `redis-cli`
-RESP (REdis Serialization Protocol) is the real wire format Redis uses, so
-`redis-cli` (and anything else actually speaking Redis) can talk to the
-server. Every value is sent with an explicit type marker and, where needed,
-an explicit length — so the receiver never has to guess where one value ends
-and the next begins (unlike plain text split on spaces, which breaks the
-moment a value itself contains a space).
+Switched wire format to RESP so real `redis-cli` can connect: Simple String
+(`+OK\r\n`), Error (`-ERROR: ...\r\n`), Bulk String (`$<len>\r\n<content>\r\n`),
+Nil (`$-1\r\n`). Incoming commands arrive as a RESP Array
+(`*3\r\n$3\r\nSET\r\n...`) — parsed by reading the `*count` header line, then
+looping `count` times reading a `$length` line + content line per element.
 
-Types used so far:
-- Simple String: `+OK\r\n`
-- Error: `-ERROR: ...\r\n`
-- Bulk String: `$<length>\r\n<content>\r\n`, e.g. `$3\r\nola\r\n`
-- Nil (missing value): `$-1\r\n` — no content section at all, since length
-  `-1` means "don't look for content."
-- (Not yet used: Integer `:1000\r\n`, Array `*<count>\r\n...`.)
+**Bugs found and fixed:**
+- *Flush bug*: switching `pw.println` → `pw.print` (needed to avoid
+  `println`'s extra newline corrupting exact RESP bytes) silently dropped
+  every response — `PrintWriter.autoFlush` only triggers on
+  `println`/`printf`/`format`, never on plain `print()`. Fixed with explicit
+  `pw.flush()` after every `pw.print(...)`.
+- *`COMMAND DOCS` deadlock*: real interactive `redis-cli` silently sends
+  `COMMAND DOCS` on connect; the `if/else if` chain had no final `else`, so
+  nothing was ever sent back and `redis-cli` hung forever waiting for a
+  response. Fixed by adding `else { pw.print("-ERROR: Unknown command\r\n"); }`.
+- *Homebrew/Rosetta*: `brew install redis` tried to build from source
+  (LLVM/Rust included) because the only Homebrew present was the Intel-only
+  install at `/usr/local`, running under Rosetta on this `arm64` Mac. Fixed
+  by installing native Homebrew at `/opt/homebrew`.
 
-What changed in `Server.java`:
-- All six response paths (`SET`/`GET`/`DEL`, success and error cases) now
-  send properly formatted RESP bytes via `pw.print(...)`, built as plain
-  Java string concatenation (e.g. `"$" + value.length() + "\r\n" + value +
-  "\r\n"`).
-- `GET` on an existing key replies a Bulk String; on a missing key, replies
-  the nil Bulk String (`$-1\r\n`) instead of crashing or sending literal
-  `"null"`.
-- `SET`/`DEL` success replies `+OK\r\n` (Simple String); all three commands'
-  validation-failure replies now use `-ERROR: ...\r\n` (Error type).
-- Verified with raw byte inspection (`xxd`) over a real `nc` connection
-  covering `SET`, `GET` (hit and miss), `DEL`, and a malformed bare `GET` —
-  confirmed byte-for-byte correct RESP output for every case, and confirmed
-  the server survives the malformed command.
+Known limitation: content lines are read via `readLine()` (stops at `\r\n`),
+not the exact `$<length>` byte count — would misread a value containing a
+literal `\r`/`\n`. Not fixed yet.
 
-**Bug found and fixed along the way — buffering/flushing:** switching
-responses from `pw.println(...)` to `pw.print(...)` (needed to avoid
-`println`'s automatic extra newline corrupting the exact RESP bytes) silently
-broke every response — `PrintWriter`'s `autoFlush` only triggers on
-`println`/`printf`/`format`, **not** on plain `print()`, regardless of
-whether the string itself contains `\n`. Every `pw.print(...)` call was
-sitting in an internal buffer that was discarded in full the moment
-`client.close()` ran, meaning the client received **zero bytes** for a while
-before this was caught by inspecting raw bytes with `xxd` (output just
-showed nothing). Fixed by adding an explicit `pw.flush();` after every
-`pw.print(...)` call.
-
-**Incoming RESP parsing (Arrays of Bulk Strings):** real `redis-cli` doesn't
-send plain text — it sends commands as a RESP Array, e.g.
-`SET name ola` arrives as `*3\r\n$3\r\nSET\r\n$4\r\nname\r\n$3\r\nola\r\n`.
-Since `BufferedReader.readLine()` already stops at every `\r\n`, no raw-byte
-reading was needed — just reading the *right sequence* of lines:
-1. Read one line for the array header (`*3`), strip the `*`
-   (`String.substring(1)`), parse the rest as an `int` (`Integer.parseInt`)
-   to get the element count.
-2. Loop that many times; each iteration reads **two** lines — a `$<length>`
-   line (currently unused/discarded) and the actual content line — storing
-   just the content into a `String[] parts`, the same shape `text.split(" ")`
-   used to produce. The rest of the existing `if (parts[0].equals("SET"))`
-   chain needed no changes at all.
-
-Key mental model that took some back-and-forth to land: `reader.readLine()`
-always advances to the *next* unread line in the stream, never re-reads the
-same spot — so two consecutive calls in one loop iteration naturally pull
-two different, consecutive lines (the length line, then the content line).
-
-**Verified against the real, official `redis-cli`** (not just hand-crafted
-bytes via `nc`) — `SET name ola` → `OK`, `GET name` → `ola`, `DEL name` →
-`OK`, `GET name` again → empty/nil. This is a stronger proof of correctness
-than any self-written test, since `redis-cli` is an independent, real-world
-RESP implementation with zero knowledge of this codebase.
-
-**Known limitation:** content lines are still read with `readLine()`
-(stopping at the next `\r\n`), not by reading the exact `$<length>` byte
-count. A value containing an embedded `\r` or `\n` (legitimate in real RESP,
-e.g. binary data) would be read incorrectly / cut short. Not fixed yet —
-noted for later.
-
-Integer RESP type (`:1000\r\n`) isn't implemented yet (not needed by any
-current command).
-
-**Side quest — Homebrew/Rosetta fix:** installing `redis` (for `redis-cli`)
-via the existing Homebrew first attempted to build `redis` **and its
-dependencies, including LLVM and Rust, entirely from source** — a
-multi-hour, many-GB undertaking. Cause: this Mac is Apple Silicon (`arm64`),
-but the only Homebrew install present lived at `/usr/local` — the
-Intel-only location — likely installed a while ago and running under
-Rosetta, so it identified as "Intel x86_64" and found no prebuilt binaries
-for that (now-dropped) platform/arch combination. Fixed by installing a
-second, native Homebrew at `/opt/homebrew` (the correct location for Apple
-Silicon) via the official installer script — `redis` then installed in
-seconds from a prebuilt `arm64` bottle. Worth remembering if other brew
-installs on this machine seem to unexpectedly want to compile from source.
-
-**Bug found and fixed — `COMMAND DOCS` deadlock in real interactive
-`redis-cli`:** one-shot commands (`redis-cli -p 6379 SET ...`) and piped
-input both worked, but a genuine interactive session (just `redis-cli -p
-6379`, typed into live) hung completely — no response, no server output at
-all. Root cause, found by capturing the raw bytes `redis-cli` sends on
-connect (via `nc` as a dummy listener): real interactive `redis-cli`
-silently sends `COMMAND DOCS` (`*2\r\n$7\r\nCOMMAND\r\n$4\r\nDOCS\r\n`)
-immediately after connecting, to fetch command metadata for its own
-autocomplete/hints. The server's array parsing handled this fine
-structurally (`parts = ["COMMAND", "DOCS"]`), but the `if`/`else if` chain
-only matched `SET`/`GET`/`DEL` and had no final `else` — so nothing was ever
-sent back. Meanwhile `redis-cli` was blocked waiting for *any* response to
-`COMMAND DOCS` before proceeding. Both sides waited on each other forever —
-a deadlock, not a crash, which is why nothing printed anywhere. Fixed by
-adding a final `else` branch that replies `-ERROR: Unknown command\r\n` for
-any unrecognized command — a response (even an error) is enough to unblock
-`redis-cli` and let it proceed to accept real typed commands.
+Verified against real `redis-cli`: `SET`/`GET`/`DEL` all correct, including
+nil on a missing key.
 
 ### Step 4 — Concurrency (`src/Server.java`) — done (each client on its own thread)
-Previously, `.accept()` was only called again *after* the current client's
-entire read/respond loop had finished — meaning a second client couldn't
-connect at all while the first was still active, no matter how slow or idle
-it was.
+Per-client logic moved into `new Thread(() -> {...}).start()`, so `.accept()`
+is never blocked by a slow/idle client. Thread body wrapped in
+`try {...} catch (Exception e) {...} finally { client.close(); }` — broad
+catch is deliberate here (failure isolation per client), `finally` guarantees
+the socket is always released.
 
-What changed:
-- The per-client logic (everything from `getInputStream()` down through
-  `client.close()`) is now wrapped in `new Thread(() -> { ... }).start();`,
-  handed off immediately after `.accept()` returns. The main loop's only job
-  per iteration is now: accept a connection, launch a thread for it, go
-  straight back to `.accept()` for the next one — never blocked by any one
-  client.
-- The thread body is wrapped in `try { ... } catch (Exception e) { ... }
-  finally { client.close(); }` — a single broad `catch (Exception e)`,
-  deliberately, since this is a failure-isolation boundary: *any* unexpected
-  problem from one client (malformed input, a bug, anything) should be
-  contained to that one thread, never crash the server or other clients.
-  The `finally` guarantees `client.close()` always runs — even if something
-  above it threw — releasing the socket (and its OS-level file descriptor)
-  so the server doesn't leak resources over time as clients come and go.
-- Verified concurrency genuinely works: connected a deliberately
-  "slow"/open client first, then a second client while the first was still
-  connected — the second client got its response immediately, proving it
-  wasn't stuck waiting behind the first.
+**Bugs found and fixed:**
+- *Leaked socket*: an uncaught `NumberFormatException` (only `IOException`
+  was caught) skipped `client.close()` entirely, leaving that client's
+  connection open forever. Fixed by broadening to `catch (Exception e)` + `finally`.
+- *Thread-unsafe map*: `Store`'s `HashMap` was shared across client threads
+  with no synchronization — real risk of corruption/lost updates under
+  concurrent writes. Fixed by swapping to `ConcurrentHashMap` (chosen over
+  `synchronized` methods, which would serialize all access and defeat the
+  point of threading).
 
-**Bug found and fixed along the way — uncaught exception leaking a
-socket:** while testing, a malformed client command crashed its thread with
-an uncaught `NumberFormatException` (only `IOException` was caught at the
-time) — the thread died silently, but `client.close()` never ran, since it
-sat after the exception point with no `finally`. The symptom: the crashed
-client's `nc` process just hung forever, since the server never told its
-OS to tear down that TCP connection. This is exactly why the `finally`
-block exists now, and why `catch (Exception e)` (broad, but intentional at
-this specific boundary) replaced separate `catch (IOException)` /
-`catch (NumberFormatException)` blocks — any future exception type is
-covered the same way, without needing to anticipate and add a new `catch`
-for each one.
-
-**What `client.close()` actually does**, worth remembering: it tells the OS
-to close the underlying TCP connection and release the file descriptor tied
-to that socket. Every open socket holds onto a limited OS resource; skipping
-`close()` means that resource stays reserved forever even after the
-client's work is done — eventually exhausting the limit and causing new
-connections to start failing. (Analogy: `accept()` picks up a phone line for
-one call; `close()` actually hangs it up, freeing that line for the next
-caller. Skipping it leaves the line permanently tied up.)
-
-**Thread-safety fix — `HashMap` → `ConcurrentHashMap`:** `Store`'s map was
-shared across multiple client threads with zero synchronization — `HashMap`
-is **not** thread-safe; concurrent writes from different threads can corrupt
-its internal structure (a well-documented real bug class: concurrent
-`HashMap` resizing has caused infinite loops pinning a CPU core at 100% in
-older Java versions) or silently lose updates. Fixed by swapping to
-`java.util.concurrent.ConcurrentHashMap` in `Store.java` — a drop-in
-replacement here, since it implements the same `Map` interface (`get`/`put`/
-`remove` unchanged) but is built to be safely used by multiple threads at
-once, including real internal parallelism rather than locking the whole map
-per operation. Verified with `redis-cli` afterward — identical external
-behavior (`SET`/`GET`/`DEL` all still correct), confirming the swap changed
-only the thread-safety guarantee, not any observable behavior.
-
-(Noted but not chosen: the alternative fix would have been marking
-`Store`'s methods `synchronized`, forcing one-at-a-time access manually —
-simpler to reason about, but serializes all data access, losing the
-parallelism threading was meant to add. `ConcurrentHashMap` gets
-thread-safety without that cost.)
+Verified: a slow/open client no longer blocks a second client from getting
+an immediate response.
 
 ### Step 5 — Persistence (`src/Store.java`) — done (append-only log)
-Goal: make data survive a server restart. Previously, `Store`'s map lived
-only in memory — stopping and restarting the server lost everything.
+`setValue`/`deleteValue` each append one line to `log.txt`
+(`SET key value` / `DEL key`, human-readable, not RESP) via
+`FileWriter(path, append=true)` in try-with-resources. `Store`'s constructor
+replays `log.txt` on startup by calling `hashmap.put`/`hashmap.remove`
+**directly** (not `setValue`/`deleteValue`, which would re-log and double
+the file every restart). Logic lives in `Store`, not `Server`, since `Store`
+is what knows when a real mutation happens.
 
-Design decisions made before writing code:
-- **Log format**: plain, human-readable text, reusing the original
-  space-separated style (`SET key value` / `DEL key`), one command per line
-  — not RESP, which real Redis uses for its AOF, but a deliberate
-  simplification here.
-- **Where the logic lives**: inside `Store` itself (not `Server`), since
-  `Store` is what actually knows when a real mutation happens. This keeps
-  persistence a property of the data store, independent of how commands
-  arrive.
+**Bug found and fixed:** a value containing a space (`SET age "22 ar"`) came
+back truncated to `"22"` after a restart — `line.split(" ")` produced 4
+pieces and replay only read `parts[2]`. Fixed with `line.split(" ", 3)`,
+capping the split so everything after the 2nd space stays together as one
+piece — same underlying problem RESP's length-prefixing solves, resurfacing
+in the simpler log format.
+
+Verified: `SET name ola` → restart → `GET name` (no re-`SET`) → correctly `ola`.
+
+Known limitations: log only ever grows (no compaction); no handling for a
+corrupted/incomplete line (e.g. crash mid-write).
+
+### Step 6a — Key expiration / TTL (`src/Store.java`, `src/Server.java`) — done
+New `ValueEntry` wrapper (`value` + nullable `Long expiresAt`) replaces the
+plain `String` in `Store`'s map (`ConcurrentHashMap<String, ValueEntry>`) —
+keeps a key's related data together rather than a second parallel map.
+`expiresAt` is boxed `Long` specifically so `null` can mean "never expires."
+Expiration is lazy (check-on-read) only, no background sweep.
 
 What changed:
-- `setValue`/`deleteValue` each append one line to `log.txt` (via
-  `FileWriter(..., true)` — the `true` means *append*, not overwrite) right
-  after mutating the in-memory map. Both use try-with-resources
-  (`try (FileWriter fw = ...) { ... }`) so the writer is guaranteed to close
-  (and actually flush to disk) even if something throws.
-- `Store` got a constructor: on startup, if `log.txt` exists, it reads the
-  file line by line and replays each command — but by calling
-  `hashmap.put(...)`/`hashmap.remove(...)` **directly**, not
-  `setValue`/`deleteValue`. Calling the real methods during replay would
-  re-trigger logging, doubling (and on the next restart, quadrupling, etc.)
-  the log file.
-- Verified end-to-end: `SET name ola` → restart the server (new process,
-  fresh `Store`) → `GET name` without ever re-sending `SET` → correctly
-  returned `ola`, proving the constructor replayed the log and rebuilt state
-  before accepting any connections.
+- `getValue`: null entry → `null`; non-null but past `expiresAt` → calls
+  `deleteValue(key)` (removes + logs a `DEL`) and returns `null`; otherwise
+  → returns the value.
+- `setValue` overloaded: `setValue(key, value)` (no expiry) and
+  `setValue(key, value, ttlSeconds)` (`expiresAt = now + ttlSeconds * 1000`
+  — ttl in seconds, `expiresAt` in ms, units must convert).
+- New `setExpiry(key, ttlSeconds)` sets a TTL on an existing key without
+  resupplying its value; no-ops if the key is missing.
+- New `EXPIRE key seconds` command in `Server.java`, same shape as the
+  others, replies `+OK\r\n`.
 
-**Bug found and fixed — multi-word values corrupted by replay:** a value
-containing a space (`SET age "22 ar"`) worked correctly *before* a restart
-(live command handling already reads exact RESP content lines, unaffected),
-but came back as just `"22"` — silently truncated — *after* a restart.
-Cause: the log line `SET age 22 ar` split on plain `" "` produces 4 elements
-(`["SET", "age", "22", "ar"]`), and the replay code only read `parts[2]`
-(`"22"`), with no idea `parts[3]` was part of the same value — the same
-fundamental "delimiter can't distinguish a real separator from a value that
-happens to contain one" problem RESP's length-prefixing exists to solve,
-resurfacing in the simpler log format. Fixed with `line.split(" ", 3)` — the
-`limit` argument caps the split at 3 pieces, so everything after the second
-space-cut gets kept together as one final piece
-(`["SET", "age", "22 ar"]`). Works uniformly for `DEL` lines too, which
-naturally only produce 2 pieces regardless of the limit.
+**Bugs found and fixed:**
+- Two separate `NullPointerException` risks (missing `entry == null` checks
+  in `getValue` and `setExpiry`) — same bug class each time, caught before shipping.
+- Unit mismatch: first draft added `ttlSeconds` directly to
+  `currentTimeMillis()` without `* 1000`, mixing seconds and milliseconds —
+  keys would've expired almost instantly.
+- String-concatenation bug in the log line: `"..." + currentTimeMillis() +
+  ttlSeconds * 1000` looked like numeric addition but, once the expression
+  was already a `String`, Java appended the second number's *text* instead
+  of adding it — e.g. `...1697000000000` immediately followed by `2000`,
+  glued together, not summed. Fixed by computing `expiresAt` once into a
+  variable and reusing it for both the field and the log line.
 
-Known limitations:
-- The log only ever grows — it's never compacted/rewritten (real Redis
-  periodically rewrites its AOF to drop dead history, e.g. a key that was
-  `SET` then later `DEL`eted doesn't need either line kept forever). Not
-  addressed yet.
-- No handling yet for a log line that's corrupted/incomplete (e.g. the
-  process crashes mid-write) — replay would likely throw on such a line.
+Verified against real `redis-cli`: `SET foo bar` → `EXPIRE foo 2` → `GET foo`
+still `bar` → after waiting past 2s, `GET foo` → nil.
+
+### Step 6b — TTL persistence across restarts (`src/Store.java`) — done
+Log line stores the **absolute** `expiresAt` timestamp (`EXPIRE foo
+1697000005000`), not the relative ttl — logging the relative value would be
+wrong on replay, since re-adding it to a *new* "now" (however long after
+restart) would push the expiry further out or resurrect an already-expired
+key.
+
+Constructor's replay loop got an `EXPIRE` branch: looks up the key's
+`ValueEntry`, sets `expiresAt = Long.parseLong(parts[2])` (`Long`, not `int`
+— a ms timestamp overflows `int`). Missing key → `continue`, not `return`
+(`return` would've aborted replaying the rest of the log file too).
+
+Verified: `SET foo bar` → `EXPIRE foo 100` → kill + restart server → `GET foo`
+still `bar` immediately after restart.
 
 ### Next up
-- Key expiration (TTL), then replication to a second server (steps 6+).
+- Replication to a second server (step 7).
 - Maybe: fix content-line reading in `Server.java`'s RESP parsing to respect
   `$<length>` exactly, instead of relying on `readLine()`.
+- Known gap: the log only ever grows, including `EXPIRE` lines — never compacted.
 
 ## Running it manually
 
@@ -327,6 +170,7 @@ In another terminal, act as a client with the real `redis-cli`:
 ```
 redis-cli -p 6379 SET name ola
 redis-cli -p 6379 GET name
+redis-cli -p 6379 EXPIRE name 60
 redis-cli -p 6379 DEL name
 ```
 Or connect with raw hand-crafted RESP bytes via `nc` (useful for inspecting

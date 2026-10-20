@@ -24,6 +24,10 @@ public class Store {
                     hashmap.put(parts[1], new ValueEntry(parts[2], null));
                 } else if (parts[0].equals("DEL")) {
                     hashmap.remove(parts[1]);
+                } else if (parts[0].equals("EXPIRE")) {
+                    ValueEntry entry = hashmap.get(parts[1]);
+                    if (entry == null) continue; //Use continue instead of return as it will just skip this line so it doesnt stop the while loop preventing later commands in the log from running
+                    entry.expiresAt = Long.parseLong(parts[2]);
                 }
             }
         } catch (IOException e) {
@@ -87,6 +91,22 @@ public class Store {
             fw.write("DEL " + key + "\n");
         } catch (IOException e) {
             System.out.println("IO exception while deleting value");
+        }
+    }
+
+    public void setExpiry(String key, long ttlSeconds) {
+        ValueEntry entry = hashmap.get(key);
+        if (entry == null) {
+            return;
+        }
+        long expiresAt = System.currentTimeMillis() + ttlSeconds * 1000;
+        entry.expiresAt = expiresAt;
+
+        //Logging av kvar kommando
+        try (FileWriter fw = new FileWriter("log.txt", true)) {
+            fw.write("EXPIRE " + key + " " + expiresAt + "\n");
+        } catch (IOException e) {
+            System.out.println("IOException while logging/setting expiry");
         }
     }
 

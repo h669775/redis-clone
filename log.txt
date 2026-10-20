@@ -1,12 +1,2 @@
-SET name ola
-SET temp hello
-SET temp hello
-DEL temp
-SET temp hello
-SET temp hello
-DEL temp
-SET temp hello
-SET temp hello
-DEL temp
-SET temp hello
-DEL temp
+SET foo bar
+EXPIRE foo 1792494445857
