@@ -1,5 +1,4 @@
 import java.io.BufferedReader;
-
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.PrintWriter;
@@ -9,9 +8,20 @@ import java.net.Socket;
 public class Server {
 
     public static void main(String[] args) throws Exception {
-        ServerSocket socket = new ServerSocket(6379);
-        if (socket.getLocalPort() == 6379) {
-            System.out.println("Server listening on port 6379!");
+        boolean isReplica = args.length > 0 && args[0].equals("replica"); //checks if args is empty or not and checks if the server running is the replica by looking at the first element of args
+        if (isReplica && args.length < 4) { //checks if there are both replica and server hosts/ports
+            System.out.println("Usage: java Server replica <ownPort> <primaryHost> <primaryPort>");
+            return;
+        }
+        int port = isReplica ? Integer.parseInt(args[1]) : 6379;
+
+        String primaryHost = isReplica ? args[2] : null; //if there is a replica put the primaryHost value as the args[2] which will be the hostname
+        int primaryPort = isReplica ? Integer.parseInt(args[3]) : -1; //If there is a replica, put the primaryPort number as the args[3] which will be the portnumber written.
+        
+        
+        ServerSocket socket = new ServerSocket(port);
+        if (socket.getLocalPort() == port) {
+            System.out.println("Server listening on port " + port + "!");
         }
 
         Store store = new Store(); //Will store data in memory

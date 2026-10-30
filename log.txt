@@ -1,2 +1,0 @@
-SET foo bar
-EXPIRE foo 1792494445857
